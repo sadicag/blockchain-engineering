@@ -27,7 +27,7 @@ SERVER_PUBLIC_KEY_BIN = bytes.fromhex(
     "36c501ce5c09364e0ebb"
 )
 
-DIFFICULTY = 28 # The leading zero bits
+DIFFICULTY = 28
 
 # --- Payloads ---
 
@@ -47,11 +47,7 @@ class ResponsePayload(DataClassPayloadWID):
 
 # --- Proof of Work ---
 
-def check_difficulty(
-    digest: bytes, 
-    bits: int
-) -> bool:
-
+def check_difficulty(digest: bytes, bits: int) -> bool:
     full_bytes, extra_bits = divmod(bits, 8)
     if any(b != 0 for b in digest[:full_bytes]):
         return False
@@ -60,20 +56,13 @@ def check_difficulty(
     return digest[full_bytes] < (1 << (8 - extra_bits))
 
 
-def mine_pow(
-    email: str, 
-    github_url: str, 
-    difficulty: int = DIFFICULTY
-) -> int:
-
+def mine_pow(email: str, github_url: str, difficulty: int = DIFFICULTY) -> int:
     prefix = email.encode("utf-8") + b"\n" + github_url.encode("utf-8") + b"\n"
     t0 = time.time()
     report_every = 2_000_000
     print(f"\nMining PoW (difficulty={difficulty} bits) ...")
     print(f"    prefix = {prefix!r}")
     nonce = 0
-
-    # Start the mining!
     while True:
         data = prefix + struct.pack(">q", nonce)
         digest = hashlib.sha256(data).digest()
@@ -88,15 +77,10 @@ def mine_pow(
             elapsed = time.time() - t0
             rate = nonce / elapsed
             eta = (2 ** difficulty) / rate
-            print(f"   ... {nonce:,} hashes  ({rate/1e6:.2f} Mh/s)  ETA around {eta:.0f}s total")
+            print(f"   ... {nonce:,} hashes  ({rate/1e6:.2f} Mh/s)  ETA ~{eta:.0f}s total")
 
-def verify_pow(
-    email: str, 
-    github_url: str, 
-    nonce: int,
-    difficulty: int = DIFFICULTY
-) -> tuple[bool, str]:
 
+def verify_pow(email: str, github_url: str, nonce: int, difficulty: int = DIFFICULTY) -> tuple[bool, str]:
     data = (email.encode("utf-8") + b"\n" +
             github_url.encode("utf-8") + b"\n" +
             struct.pack(">q", nonce))
@@ -108,83 +92,117 @@ def verify_pow(
 class Lab1Community(Community):
     community_id = COMMUNITY_ID
 
-    def __init__(
-        self, settings: CommunitySettings,
-    ) -> None:
-
+    def __init__(self, settings: CommunitySettings) -> None:
         super().__init__(settings)
         self.email = settings.email
         self.github_url = settings.github_url
         self.nonce = settings.nonce
-        self._submitted = False
         self._done_event = asyncio.Event()
+        self._submitted = False
         self.add_message_handler(ResponsePayload, self.on_response)
 
-    def peer_added(
-        self, 
-        peer: Peer
-    ) -> None:
+    def _is_server(self, peer: Peer) -> bool:
+        key_bin = peer.public_key.key_to_bin()
+        match = (key_bin == SERVER_PUBLIC_KEY_BIN)
+        if not match and key_bin[:10] == SERVER_PUBLIC_KEY_BIN[:10]:
+            # Same prefix but different full key — log for debugging
+            print(f"[key mismatch] peer {peer.address}")
+            print(f"  got : {key_bin.hex()}")
+            print(f"  want: {SERVER_PUBLIC_KEY_BIN.hex()}")
+        return match
 
+    def peer_added(self, peer: Peer) -> None:
         super().peer_added(peer)
-        if peer.public_key.key_to_bin() == SERVER_PUBLIC_KEY_BIN:
-            print(f"\nServer peer found at {peer.address}")
+        if self._is_server(peer):
+            print(f"\n>>> SERVER found via peer_added at {peer.address}")
             if not self._submitted:
                 self._submitted = True
-                asyncio.ensure_future(self._send_submission(peer))
+                print("    _submitted = True (peer_added)")
+                fut = asyncio.ensure_future(self._send_submission(peer))
+                fut.add_done_callback(self._on_send_done)
+            else:
+                print("    (already submitted, skipping)")
         else:
-            print(f"Discovered peer {peer.address} (not the server, ignoring)")
+            print(f"[peer] {peer.address}  key={peer.public_key.key_to_bin().hex()[:20]}...")
 
-    async def _send_submission(
-        self, 
-        server: Peer
-    ) -> None:
+    def _on_send_done(self, fut: asyncio.Future) -> None:
+        if fut.exception():
+            print(f"\n[ERROR] _send_submission raised: {fut.exception()}")
 
-        print(f"\nSending submission …")
+    async def _send_submission(self, server: Peer) -> None:
+        await asyncio.sleep(1.0)
+        print(f"\nSending submission to {server.address} ...")
         print(f"   email      = {self.email!r}")
         print(f"   github_url = {self.github_url!r}")
         print(f"   nonce      = {self.nonce}")
-        self.ez_send(server, SubmissionPayload(
+
+        payload = SubmissionPayload(
             email=self.email,
             github_url=self.github_url,
             nonce=self.nonce,
-        ))
-        print("Sent. Waiting for response …")
+        )
+
+        attempt = 0
+        while not self._done_event.is_set():
+            attempt += 1
+            print(f"   [attempt {attempt}] ez_send → {server.address}")
+            self.ez_send(server, payload)
+            # Wait up to 15s for a response before retrying
+            try:
+                await asyncio.wait_for(asyncio.shield(self._done_event.wait()), timeout=15.0)
+                break
+            except asyncio.TimeoutError:
+                if attempt >= 10:
+                    print("   [give up] 10 attempts with no response")
+                    break
+                print(f"   [no response yet, retrying...]")
 
     @lazy_wrapper(ResponsePayload)
-    def on_response(
-        self, 
-        peer: Peer, 
-        payload: ResponsePayload
-    ) -> None:
-
-        if peer.public_key.key_to_bin() != SERVER_PUBLIC_KEY_BIN:
+    def on_response(self, peer: Peer, payload: ResponsePayload) -> None:
+        if not self._is_server(peer):
             print(f"Ignoring response from non-server peer {peer.address}")
             return
-
         icon = "SUCCESS" if payload.success else "FAILURE"
-        print(f"\n{icon} Server response:")
+        print(f"\n{'='*50}")
+        print(f"{icon} — Server response:")
         print(f"   success = {payload.success}")
         print(f"   message = {payload.message!r}")
+        print('='*50)
         self._done_event.set()
 
-    async def wait_for_response(
-        self, 
-        timeout: float = 180.0
-    ) -> None:
+    async def poll_for_server(self) -> None:
+        """
+        Fallback: periodically scan already-verified peers in case
+        peer_added fired before the community was fully initialized.
+        Also re-triggers send if we found the server but got no response.
+        """
+        for _ in range(100):
+            await asyncio.sleep(3)
+            if self._done_event.is_set():
+                return
+            for peer in list(self.network.verified_peers):
+                if self._is_server(peer):
+                    if not self._submitted:
+                        print(f"\n[poll] SERVER found at {peer.address} — sending now")
+                        self._submitted = True
+                        print("    _submitted = True (poll)")
+                        fut = asyncio.ensure_future(self._send_submission(peer))
+                        fut.add_done_callback(self._on_send_done)
+                    return
 
+    async def wait_for_response(self, timeout: float = 300.0) -> None:
         try:
             await asyncio.wait_for(self._done_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            print(f"\nNo response after {timeout:.0f}s. Check connectivity.")
+            print(f"\nNo response after {timeout:.0f}s.")
+            print("Possible causes:")
+            print("  1. Server not reachable from your network")
+            print("  2. Server key mismatch (check key in log above)")
+            print("  3. Packet signing issue — ensure ez_send is used")
 
 # --- Run ---
-async def run(
-    email: str, 
-    github_url: str,
-    key_file: str,
-    nonce: int | None
-) -> None:
 
+async def run(email: str, github_url: str, key_file: str, nonce: int | None) -> None:
     if nonce is None:
         nonce = mine_pow(email, github_url)
     else:
@@ -195,8 +213,12 @@ async def run(
             print(f"Nonce {nonce} does NOT satisfy difficulty={DIFFICULTY}! SHA256 = {h}")
             sys.exit(1)
 
+    # Sanity-check the server key constant
+    assert len(SERVER_PUBLIC_KEY_BIN) == 74, f"Bad server key length: {len(SERVER_PUBLIC_KEY_BIN)}"
+    print(f"\nServer key ({len(SERVER_PUBLIC_KEY_BIN)} bytes): {SERVER_PUBLIC_KEY_BIN.hex()[:20]}...")
+
     builder = (
-        ConfigBuilder() # Also could be clean=True
+        ConfigBuilder()
         .add_key("my_key", "curve25519", key_file)
         .set_port(0)
         .set_address("0.0.0.0")
@@ -234,38 +256,43 @@ async def run(
     ipv8 = IPv8(builder.finalize(), extra_communities={"Lab1Community": Lab1Community})
     await ipv8.start()
     print(f"\nIPv8 started. Key file: {key_file}")
-    print("Keep this .pem file safe - it is your permanent identity!\n")
+    print("Keep this .pem file safe — it is your permanent identity!\n")
 
     community: Lab1Community = ipv8.get_overlay(Lab1Community)
-    print("Discovering server peer ...")
-    await community.wait_for_response(timeout=180.0)
+
+    # Start the polling fallback alongside the event-driven path
+    asyncio.ensure_future(community.poll_for_server())
+
+    async def debug_loop():
+        for _ in range(30):
+            await asyncio.sleep(10)
+            if community._done_event.is_set():
+                return
+            peers = list(community.network.verified_peers)
+            print(f"\n[debug] {len(peers)} community peers:")
+            server_seen = False
+            for p in peers:
+                key = p.public_key.key_to_bin()
+                is_srv = (key == SERVER_PUBLIC_KEY_BIN)
+                tag = " *** SERVER ***" if is_srv else ""
+                print(f"  {p.address}  key={key.hex()[:20]}...{tag}")
+                if is_srv:
+                    server_seen = True
+            if not server_seen:
+                print("  (server not yet seen in community peers)")
+
+    asyncio.ensure_future(debug_loop())
+    await community.wait_for_response(timeout=300.0)
     await ipv8.stop()
     print("\nDone.")
 
+
 def main() -> None:
-
-    parser = argparse.ArgumentParser(
-        description="Lab 1 — IPv8 Proof-of-Work client",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-
-        epilog="""
-Examples:
-  python lab1_client.py \\
-      --email j.doe@student.tudelft.nl \\
-      --github https://github.com/jdoe/lab1-ipv8
-
-  # Re-submit with a saved nonce (skips mining):
-  python lab1_client.py \\
-      --email j.doe@student.tudelft.nl \\
-      --github https://github.com/jdoe/lab1-ipv8 \\
-      --nonce 123456789
-""")
-    parser.add_argument("--email",  required=True, help="Your TU Delft email address")
-    parser.add_argument("--github", required=True, help="Public GitHub repo URL for this lab")
-    parser.add_argument("--key",    default="lab1_identity.pem",
-                        help="Path to .pem key file (created on first run)")
-    parser.add_argument("--nonce",  type=int, default=None,
-                        help="Use a pre-computed nonce instead of mining")
+    parser = argparse.ArgumentParser(description="Lab 1 — IPv8 Proof-of-Work client")
+    parser.add_argument("--email",  required=True)
+    parser.add_argument("--github", required=True)
+    parser.add_argument("--key",    default="lab1_identity.pem")
+    parser.add_argument("--nonce",  type=int, default=None)
     args = parser.parse_args()
 
     email = args.email.strip()
@@ -277,8 +304,8 @@ Examples:
     if any(c in email for c in ("\n", " ")):
         print("ERROR: Email must not contain newlines or spaces.")
         sys.exit(1)
-    if not github_url or len(github_url) > 512 or any(c in github_url for c in (" ","\n","\r","\t")):
-        print("ERROR: GitHub URL must be non-empty, ≤ 512 chars, no whitespace/control chars.")
+    if not github_url or len(github_url) > 512 or any(c in github_url for c in (" ", "\n", "\r", "\t")):
+        print("ERROR: GitHub URL must be non-empty, ≤512 chars, no whitespace/control chars.")
         sys.exit(1)
     if args.nonce is not None and args.nonce < 0:
         print("ERROR: Nonce must be a non-negative integer.")
@@ -289,8 +316,8 @@ Examples:
                  "ipv8.messaging", "ipv8_service"):
         logging.getLogger(name).setLevel(logging.ERROR)
 
-    asyncio.run(run(email=email, github_url=github_url,
-                    key_file=args.key, nonce=args.nonce))
+    asyncio.run(run(email=email, github_url=github_url, key_file=args.key, nonce=args.nonce))
+
 
 if __name__ == "__main__":
     main()
